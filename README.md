@@ -6,6 +6,8 @@
 [![Platform: macOS / Linux](https://img.shields.io/badge/platform-macOS%20%2F%20Linux-lightgrey)](#install)
 [![Model: Gemini Flash](https://img.shields.io/badge/model-Gemini%20Flash-orange)](#setup)
 
+![DeepScene demo](demo.gif)
+
 Decompose any video into frames + audio chunks, run Gemini Flash over each piece, synthesize a structured storyboard. No GPU. No bloat. Pipeable JSON output for agent workflows.
 
 ---
