@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# deepscene summary|detail <url-or-video> [options]
+
+set -euo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+SELF_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+
+usage() {
+  cat <<'EOF'
+usage:
+  deepscene summary <url-or-video> [--frames N] [--out DIR] [--cookies FILE] [--format md|json]
+  deepscene detail  <url-or-video> [--frames N] [--out DIR] [--cookies FILE]
+
+summary: fast video understanding report.
+detail: storyboard-grade reconstruction artifacts.
+EOF
+}
+
+case "${1:-}" in
+  summary)
+    shift
+    exec "$SELF_DIR/deepscene-summary" "$@"
+    ;;
+  detail)
+    shift
+    exec "$SELF_DIR/deepscene-detail" "$@"
+    ;;
+  -h|--help|"")
+    usage
+    ;;
+  *)
+    echo "[deepscene] unknown command: $1" >&2
+    usage >&2
+    exit 64
+    ;;
+esac

@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# deepscene-vision <frame-dir> [duration-seconds] [language]
+# Uses Gemini Vision to describe evenly-spaced video frames as a timeline.
+
+set -euo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+SELF_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+ROOT_DIR="$(cd "$SELF_DIR/.." && pwd)"
+# shellcheck source=../lib/env.sh
+source "$ROOT_DIR/lib/env.sh"
+
+FRAME_DIR="${1:-}"
+DURATION="${2:-0}"
+LANG="${3:-Vietnamese}"
+
+if [[ -z "$FRAME_DIR" || ! -d "$FRAME_DIR" ]]; then
+  echo "usage: deepscene-vision <frame-dir> [duration-seconds] [language]" >&2
+  exit 64
+fi
+if [[ -z "${GOOGLE_AI_KEY:-}" ]]; then
+  echo "[deepscene-vision] GOOGLE_AI_KEY is required for Gemini Vision." >&2
+  exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "[deepscene-vision] jq required. brew install jq / apt install jq" >&2
+  exit 1
+fi
+
+BODY_FILE="$(deepscene_mktemp "deepscene-vision.body")"
+RESP_FILE="$(deepscene_mktemp "deepscene-vision.resp")"
+cleanup() {
+  rm -f "$BODY_FILE" "$RESP_FILE"
+}
+trap cleanup EXIT
+
+python3 - "$FRAME_DIR" "$DURATION" "$LANG" "$BODY_FILE" <<'PY'
+import base64
+import json
+import sys
+from pathlib import Path
+
+frame_dir = Path(sys.argv[1])
+duration = float(sys.argv[2] or 0)
+lang = sys.argv[3] or "Vietnamese"
+body_file = Path(sys.argv[4])
+frames = sorted(frame_dir.glob("frame_*.jpg"))
+if not frames:
+    print("[deepscene-vision] no frame_*.jpg files found", file=sys.stderr)
+    sys.exit(64)
+
+prompt = f"""
+Analyze these evenly spaced video frames. Reply in {lang}.
+
+For each frame, provide:
+- approximate timestamp
+- visible characters or people
+- actions and body language
+- setting/background
+- important objects and on-screen text
+- what this likely means in the story or workflow
+- uncertainties where relevant
+
+Then provide:
+- overall timeline summary
+- main characters/entities
+- important visual events
+
+Do not invent dialogue that is not visible or provided. Be detailed and practical.
+""".strip()
+
+parts = [{"text": prompt}]
+for idx, frame in enumerate(frames, 1):
+    ts = (idx / (len(frames) + 1)) * duration if duration > 0 else 0
+    parts.append({"text": f"Frame {idx:02d}, approx timestamp {ts:.1f}s:"})
+    parts.append({
+        "inline_data": {
+            "mime_type": "image/jpeg",
+            "data": base64.b64encode(frame.read_bytes()).decode("ascii"),
+        }
+    })
+
+body = {
+    "contents": [{"parts": parts}],
+    "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192},
+}
+body_file.write_text(json.dumps(body), encoding="utf-8")
+PY
+
+RESP="$(curl -sS -X POST \
+  -H "Content-Type: application/json" \
+  -H "x-goog-api-key: $GOOGLE_AI_KEY" \
+  -H "User-Agent: $DEEPSCENE_USER_AGENT" \
+  --data-binary "@$BODY_FILE" \
+  "https://generativelanguage.googleapis.com/v1beta/models/${DEEPSCENE_GEMINI_VISION_MODEL:-${DEEPSCENE_GEMINI_MODEL:-gemini-2.5-flash}}:generateContent")"
+
+printf '%s' "$RESP" > "$RESP_FILE"
+TEXT="$(jq -r '.candidates[0].content.parts[0].text // empty' "$RESP_FILE")"
+if [[ -z "$TEXT" ]]; then
+  ERR="$(jq -r '.error.message // "unknown error"' "$RESP_FILE")"
+  echo "[deepscene-vision] Gemini Vision call failed: $ERR" >&2
+  exit 1
+fi
+
+printf '%s\n' "$TEXT"

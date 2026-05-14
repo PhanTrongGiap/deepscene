@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# deepscene-download <url> [out-dir]
+# Downloads a video from any yt-dlp-supported platform (YouTube, X,
+# LinkedIn, TikTok, Reddit, Vimeo, Facebook, …) into a local mp4 and
+# prints the absolute path on stdout. Stderr carries progress.
+#
+# Cookie fallback (4 tiers, tried in order):
+#   1. Anonymous fetch — works for all public videos.
+#   2. Auto-detect signed-in browser (Chrome → Firefox → Safari → Edge).
+#      Override via DEEPSCENE_BROWSER=chrome|firefox|safari|edge|brave|chromium.
+#   3. Manual cookies file via --cookies <file> (Netscape format).
+#   4. Graceful error with guidance — no silent failure.
+
+set -euo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+SELF_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+ROOT_DIR="$(cd "$SELF_DIR/.." && pwd)"
+# shellcheck source=../lib/env.sh
+source "$ROOT_DIR/lib/env.sh"
+
+URL=""
+OUTDIR=""
+COOKIES_FILE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --cookies)
+      COOKIES_FILE="$2"
+      shift 2
+      ;;
+    --cookies=*)
+      COOKIES_FILE="${1#*=}"
+      shift
+      ;;
+    -h|--help)
+      sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *)
+      if [[ -z "$URL" ]]; then
+        URL="$1"
+      elif [[ -z "$OUTDIR" ]]; then
+        OUTDIR="$1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$URL" ]]; then
+  echo "usage: deepscene-download <url> [out-dir] [--cookies <file>]" >&2
+  exit 64
+fi
+deepscene_validate_url "$URL"
+
+if ! command -v yt-dlp >/dev/null 2>&1; then
+  echo "[deepscene-download] yt-dlp not found. Install:" >&2
+  echo "  brew install yt-dlp     # macOS" >&2
+  echo "  pipx install yt-dlp     # Linux/Windows" >&2
+  exit 1
+fi
+
+if [[ -z "$OUTDIR" ]]; then
+  OUTDIR="$(deepscene_cache_dir)/videos"
+fi
+if [[ -L "$OUTDIR" ]]; then
+  echo "[deepscene-download] refusing symlink output dir: $OUTDIR" >&2
+  exit 1
+fi
+mkdir -p "$OUTDIR"
+chmod 700 "$OUTDIR" 2>/dev/null || true
+
+# Idempotent cache: same URL → same output file.
+HASH="$(echo -n "$URL" | shasum | cut -c1-12)"
+OUT="$OUTDIR/$HASH.mp4"
+if [[ -s "$OUT" ]]; then
+  echo "$OUT"
+  exit 0
+fi
+
+# ≤720p single-file format keeps downloads quick and avoids the bv*+ba
+# merge path which fails on hosts (LinkedIn, FB) that only expose one
+# muxed file. /best fallback covers everything else.
+FORMAT='best[height<=720]/best'
+
+run_dl() {
+  deepscene_run_with_timeout yt-dlp \
+    --no-playlist \
+    --no-warnings \
+    --no-progress \
+    --merge-output-format mp4 \
+    -f "$FORMAT" \
+    -o "$OUT" \
+    "$@" \
+    "$URL" >&2
+}
+
+LAST_LOG="$(deepscene_mktemp "deepscene-download.log")"
+cleanup() {
+  rm -f "$LAST_LOG"
+}
+trap cleanup EXIT
+
+print_last_log() {
+  if [[ -s "$LAST_LOG" ]]; then
+    tail -n 12 "$LAST_LOG" >&2
+  fi
+}
+
+# Tier 1: anonymous. Public videos succeed here.
+if run_dl 2>"$LAST_LOG"; then
+  if [[ -s "$OUT" ]]; then
+    if [[ -n "${DEEPSCENE_MAX_DOWNLOAD_MB:-}" && "$DEEPSCENE_MAX_DOWNLOAD_MB" =~ ^[0-9]+$ ]]; then
+      SIZE=$(stat -f%z "$OUT" 2>/dev/null || stat -c%s "$OUT")
+      if (( SIZE > DEEPSCENE_MAX_DOWNLOAD_MB * 1024 * 1024 )); then
+        echo "[deepscene-download] downloaded file exceeds DEEPSCENE_MAX_DOWNLOAD_MB=${DEEPSCENE_MAX_DOWNLOAD_MB}" >&2
+        rm -f "$OUT"
+        exit 1
+      fi
+    fi
+    echo "$OUT"
+    exit 0
+  fi
+fi
+
+# Tier 3: caller passed --cookies file. Skip browser autodetect.
+if [[ -n "$COOKIES_FILE" ]]; then
+  echo "[deepscene-download] anonymous fetch failed, retrying with $COOKIES_FILE…" >&2
+  if [[ ! -f "$COOKIES_FILE" ]]; then
+    echo "[deepscene-download] cookies file not found: $COOKIES_FILE" >&2
+    exit 1
+  fi
+  if run_dl --cookies "$COOKIES_FILE"; then
+    if [[ -s "$OUT" ]]; then
+      if [[ -n "${DEEPSCENE_MAX_DOWNLOAD_MB:-}" && "$DEEPSCENE_MAX_DOWNLOAD_MB" =~ ^[0-9]+$ ]]; then
+        SIZE=$(stat -f%z "$OUT" 2>/dev/null || stat -c%s "$OUT")
+        if (( SIZE > DEEPSCENE_MAX_DOWNLOAD_MB * 1024 * 1024 )); then
+          echo "[deepscene-download] downloaded file exceeds DEEPSCENE_MAX_DOWNLOAD_MB=${DEEPSCENE_MAX_DOWNLOAD_MB}" >&2
+          rm -f "$OUT"
+          exit 1
+        fi
+      fi
+      echo "$OUT"
+      exit 0
+    fi
+  fi
+  echo "[deepscene-download] failed even with provided cookies" >&2
+  exit 1
+fi
+
+if [[ "${DEEPSCENE_SERVER_MODE:-}" == "1" ]]; then
+  print_last_log
+  echo "[deepscene-download] server mode is enabled; browser cookie autodetect is disabled." >&2
+  echo "[deepscene-download] Pass --cookies <file> for login-walled videos." >&2
+  exit 1
+fi
+
+# Tier 2: auto-detect signed-in browser.
+# Order: Chrome → Firefox → Safari → Edge → Brave → Chromium.
+# Override via env: DEEPSCENE_BROWSER=firefox.
+declare -a BROWSERS
+if [[ -n "${DEEPSCENE_BROWSER:-}" ]]; then
+  BROWSERS=("$DEEPSCENE_BROWSER")
+else
+  BROWSERS=(chrome firefox safari edge brave chromium)
+fi
+
+for BROWSER in "${BROWSERS[@]}"; do
+  echo "[deepscene-download] anonymous fetch failed, retrying with $BROWSER cookies…" >&2
+  if run_dl --cookies-from-browser "$BROWSER" 2>"$LAST_LOG"; then
+    if [[ -s "$OUT" ]]; then
+      if [[ -n "${DEEPSCENE_MAX_DOWNLOAD_MB:-}" && "$DEEPSCENE_MAX_DOWNLOAD_MB" =~ ^[0-9]+$ ]]; then
+        SIZE=$(stat -f%z "$OUT" 2>/dev/null || stat -c%s "$OUT")
+        if (( SIZE > DEEPSCENE_MAX_DOWNLOAD_MB * 1024 * 1024 )); then
+          echo "[deepscene-download] downloaded file exceeds DEEPSCENE_MAX_DOWNLOAD_MB=${DEEPSCENE_MAX_DOWNLOAD_MB}" >&2
+          rm -f "$OUT"
+          exit 1
+        fi
+      fi
+      echo "$OUT"
+      exit 0
+    fi
+  fi
+done
+
+# Tier 4: graceful error with actionable guidance.
+cat >&2 <<'ERR'
+[deepscene-download] Could not download — this video appears to require authentication.
+
+Three ways to fix:
+  1. Sign in to the platform in Chrome (or Firefox/Safari/Edge), then re-run.
+     deepscene auto-reads cookies from any signed-in browser.
+
+  2. Export cookies.txt (Netscape format) and pass:
+       deepscene summary <url> --cookies ~/path/to/cookies.txt
+     See https://docs/cookies.md
+
+  3. Try a public URL — most YouTube, TikTok, and Reddit videos
+     work without cookies.
+ERR
+print_last_log
+exit 1

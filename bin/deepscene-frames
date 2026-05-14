@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# deepscene-frames <video> [count] [out-dir]
+# Pulls N evenly-spaced frames from a video as JPGs (quality 4 — small but
+# legible). Prints the output directory on stdout, one frame path per line.
+#
+# Default count = 8 frames, which fits in a model's image context without
+# wasting tokens on near-duplicates and still tells the visual story of a
+# typical 30s–3min clip.
+
+set -euo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+SELF_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+ROOT_DIR="$(cd "$SELF_DIR/.." && pwd)"
+# shellcheck source=../lib/env.sh
+source "$ROOT_DIR/lib/env.sh"
+
+VIDEO="${1:-}"
+COUNT="${2:-8}"
+OUTDIR_ARG="${3:-}"
+
+if [[ -z "$VIDEO" || ! -f "$VIDEO" ]]; then
+  echo "usage: deepscene-frames <video> [count] [out-dir]" >&2
+  echo "       (file must exist)" >&2
+  exit 64
+fi
+
+if ! [[ "$COUNT" =~ ^[0-9]+$ ]] || (( COUNT < 1 )); then
+  echo "[deepscene-frames] count must be positive integer, got: $COUNT" >&2
+  exit 64
+fi
+
+if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+  echo "[deepscene-frames] ffmpeg + ffprobe required. Install:" >&2
+  echo "  brew install ffmpeg   # macOS" >&2
+  echo "  apt install ffmpeg    # Linux" >&2
+  exit 1
+fi
+
+# Output dir: explicit arg > private cache dir.
+if [[ -n "$OUTDIR_ARG" ]]; then
+  OUTDIR="$OUTDIR_ARG"
+else
+  HASH="$(echo -n "$VIDEO" | shasum | cut -c1-8)"
+  BASE="$(basename "$VIDEO" .mp4)"
+  OUTDIR="$(deepscene_cache_dir)/frames/${BASE}_${HASH}"
+fi
+if [[ -L "$OUTDIR" ]]; then
+  echo "[deepscene-frames] refusing symlink output dir: $OUTDIR" >&2
+  exit 1
+fi
+mkdir -p "$OUTDIR"
+chmod 700 "$OUTDIR" 2>/dev/null || true
+
+# Total duration in seconds (float).
+DUR="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$VIDEO" 2>/dev/null || echo 0)"
+if [[ "$DUR" == "0" || -z "$DUR" ]]; then
+  echo "[deepscene-frames] could not read duration from $VIDEO" >&2
+  exit 1
+fi
+
+# Evenly-spaced timestamps: ((i+1)/(count+1)) * duration. Skips first/last
+# frame (often black or credits).
+TIMESTAMPS="$(mktemp "$OUTDIR/.timestamps.XXXXXX")"
+python3 - "$DUR" "$COUNT" <<'PY' > "$TIMESTAMPS"
+import sys
+dur = float(sys.argv[1])
+n = int(sys.argv[2])
+for i in range(1, n + 1):
+    t = (i / (n + 1)) * dur
+    print(f"{t:.3f}")
+PY
+
+idx=1
+while IFS= read -r timestamp; do
+  frame_num="$(printf "%02d" "$idx")"
+  out="$OUTDIR/frame_${frame_num}.jpg"
+  timestamp="$(awk -v t="$timestamp" 'BEGIN { printf "%.3f", t + 0 }')"
+  if ! ffmpeg -hide_banner -loglevel error -y -ss "$timestamp" -i "$VIDEO" -frames:v 1 -q:v 4 "$out" 2>&1 >&2; then
+    echo "[deepscene-frames] failed to extract frame at ${timestamp}s" >&2
+    exit 1
+  fi
+  if [[ -s "$out" ]]; then
+    echo "$out"
+  fi
+  idx=$((idx + 1))
+done < "$TIMESTAMPS"
+
+rm -f "$TIMESTAMPS"

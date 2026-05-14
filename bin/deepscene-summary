@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# deepscene-summary <url-or-video> [--frames N] [--out DIR] [--cookies FILE]
+# Builds a concise video understanding summary.
+
+set -euo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+SELF_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+ROOT_DIR="$(cd "$SELF_DIR/.." && pwd)"
+# shellcheck source=../lib/env.sh
+source "$ROOT_DIR/lib/env.sh"
+
+export DEEPSCENE_MODE=summary
+export DEEPSCENE_PROG=deepscene-summary
+exec python3 "$ROOT_DIR/lib/storyboard.py" "$@"

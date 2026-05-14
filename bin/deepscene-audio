@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# deepscene-audio <audio-or-video> "<question>"
+# Asks Gemini a question about an audio/video file. Goes beyond pure
+# speech-to-text: hears tone, music, ambient SFX, speaker emotion,
+# language, pacing — the full audio scene.
+# Requires GOOGLE_AI_KEY.
+
+set -euo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+SELF_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+ROOT_DIR="$(cd "$SELF_DIR/.." && pwd)"
+# shellcheck source=../lib/env.sh
+source "$ROOT_DIR/lib/env.sh"
+
+INPUT="${1:-}"
+QUESTION="${2:-}"
+
+if [[ -z "$INPUT" || ! -f "$INPUT" || -z "$QUESTION" ]]; then
+  echo 'usage: deepscene-audio <audio-or-video> "<question>"' >&2
+  exit 64
+fi
+
+deepscene_audio_mode_check || exit 1
+
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "[deepscene-audio] ffmpeg required. brew install ffmpeg / apt install ffmpeg" >&2
+  exit 1
+fi
+if ! command -v jq >/dev/null 2>&1; then
+  echo "[deepscene-audio] jq required. brew install jq / apt install jq" >&2
+  exit 1
+fi
+
+HASH="$(echo -n "$INPUT" | shasum | cut -c1-10)"
+AUDIO_DIR="$(deepscene_cache_dir)/audio"
+if [[ -L "$AUDIO_DIR" ]]; then
+  echo "[deepscene-audio] refusing symlink audio cache dir: $AUDIO_DIR" >&2
+  exit 1
+fi
+mkdir -p "$AUDIO_DIR"
+chmod 700 "$AUDIO_DIR" 2>/dev/null || true
+AUDIO="$AUDIO_DIR/audioq_${HASH}.mp3"
+if [[ ! -s "$AUDIO" ]]; then
+  ffmpeg -hide_banner -loglevel error -y -i "$INPUT" \
+    -vn -ac 1 -ar 16000 -b:a 48k -f mp3 "$AUDIO" 2>&1 >&2 || {
+    echo "[deepscene-audio] ffmpeg audio extraction failed" >&2
+    exit 1
+  }
+fi
+
+SIZE=$(stat -f%z "$AUDIO" 2>/dev/null || stat -c%s "$AUDIO")
+if (( SIZE > 19 * 1024 * 1024 )); then
+  echo "[deepscene-audio] audio is $((SIZE / 1024 / 1024))MB — exceeds 20MB inline cap. Trim source first." >&2
+  exit 1
+fi
+
+# Silence guard: Gemini hallucinates plausible scene descriptions on silent
+# input rather than reporting "no audio".
+MAX_DB="$(ffmpeg -i "$AUDIO" -af volumedetect -f null /dev/null 2>&1 | \
+          awk -F': ' '/max_volume/ { gsub(" dB", "", $2); print $2; exit }')"
+if [[ -n "$MAX_DB" ]]; then
+  IS_SILENT="$(awk -v v="$MAX_DB" 'BEGIN { print (v < -60.0) ? 1 : 0 }')"
+  if [[ "$IS_SILENT" == "1" ]]; then
+    echo "[deepscene-audio] audio is silent (max_volume ${MAX_DB} dB). The video has no audible content to analyze." >&2
+    echo "(silent audio: ${MAX_DB} dB)"
+    exit 0
+  fi
+fi
+
+B64_FILE="$(mktemp "$(deepscene_cache_dir)/audioq.b64.XXXXXX")"
+BODY_FILE="$(mktemp "$(deepscene_cache_dir)/audioq.body.XXXXXX")"
+cleanup() { rm -f "$B64_FILE" "$BODY_FILE"; }
+trap cleanup EXIT
+
+base64 < "$AUDIO" | tr -d '\n' > "$B64_FILE"
+jq -n \
+  --arg q "$QUESTION" \
+  --rawfile data "$B64_FILE" \
+  '{
+    contents: [{
+      parts: [
+        { inline_data: { mime_type: "audio/mp3", data: $data } },
+        { text: $q }
+      ]
+    }],
+    generationConfig: { temperature: 0.3, maxOutputTokens: 2048 }
+  }' > "$BODY_FILE"
+
+MODEL="${DEEPSCENE_GEMINI_AUDIO_MODEL:-${DEEPSCENE_GEMINI_MODEL:-gemini-2.5-flash}}"
+RESP="$(curl -sS -X POST \
+  -H "Content-Type: application/json" \
+  -H "x-goog-api-key: $GOOGLE_AI_KEY" \
+  -H "User-Agent: $DEEPSCENE_USER_AGENT" \
+  --data-binary "@$BODY_FILE" \
+  "https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent")"
+
+TEXT="$(echo "$RESP" | jq -r '.candidates[0].content.parts[0].text // empty')"
+if [[ -z "$TEXT" ]]; then
+  ERR="$(echo "$RESP" | jq -r '.error.message // "unknown error"')"
+  echo "[deepscene-audio] Gemini call failed: $ERR" >&2
+  exit 1
+fi
+echo "$TEXT"
